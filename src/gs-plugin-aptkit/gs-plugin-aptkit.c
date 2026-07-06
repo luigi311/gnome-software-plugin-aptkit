@@ -324,11 +324,44 @@ aptkit_transaction_signal_cb (GDBusProxy *proxy,
       g_free (data);
     } else if (g_strcmp0 (property_name, "Progress") == 0) {
       gint32 progress;
+      guint progress_percent;
+
       g_variant_get (value, "i", &progress);
-      if (data->progress_callback != NULL) {
-        /* aptkit inherits aptdaemon's 0-101 range, where 101 means indeterminate */
-        guint progress_percent = (progress >= 0 && progress <= 100) ? (guint) progress : GS_APP_PROGRESS_UNKNOWN;
+      /* aptkit inherits aptdaemon's 0-101 range, where 101 means indeterminate */
+      progress_percent = (progress >= 0 && progress <= 100) ? (guint) progress : GS_APP_PROGRESS_UNKNOWN;
+
+      if (data->progress_callback != NULL)
         data->progress_callback (GS_PLUGIN (data->plugin), progress_percent, data->progress_user_data);
+
+      /* apt transactions are atomic, so the transaction-wide percentage is
+       * the per-app progress too */
+      if (data->action == ACTION_UPGRADE_SYSTEM) {
+        for (guint i = 0; i < gs_app_list_length (data->plugin->updatable_apps); i++) {
+          GsApp *app = gs_app_list_index (data->plugin->updatable_apps, i);
+          gs_app_set_progress (app, progress_percent);
+        }
+      }
+    } else if (g_strcmp0 (property_name, "ProgressDownload") == 0) {
+      const gchar *uri;
+      const gchar *status;
+      const gchar *short_desc;
+      const gchar *msg;
+      gint64 total_size;
+      gint64 partial_size;
+
+      g_variant_get (value, "(&s&s&sxx&s)",
+                     &uri, &status, &short_desc, &total_size, &partial_size, &msg);
+
+      /* during an upgrade each fetched item is a package and short_desc is
+       * its name, so we can attach real download sizes to the apps */
+      if (data->action == ACTION_UPGRADE_SYSTEM && total_size > 0) {
+        for (guint i = 0; i < gs_app_list_length (data->plugin->updatable_apps); i++) {
+          GsApp *app = gs_app_list_index (data->plugin->updatable_apps, i);
+          if (g_strcmp0 (gs_app_get_metadata_item (app, "aptkit::package-name"), short_desc) == 0) {
+            gs_app_set_size_download (app, GS_SIZE_TYPE_VALID, (guint64) total_size);
+            break;
+          }
+        }
       }
     } else if (g_strcmp0 (property_name, "Packages") == 0 ||
                g_strcmp0 (property_name, "Dependencies") == 0) {
@@ -345,40 +378,41 @@ aptkit_transaction_signal_cb (GDBusProxy *proxy,
         packages = g_dbus_proxy_get_cached_property (proxy, "Packages");
       }
 
-      if (packages != NULL && dependencies != NULL) {
+      /* only rebuild the app list when simulating for a listing; during a
+       * real upgrade this would replace the apps GNOME Software is showing */
+      if (packages != NULL && dependencies != NULL &&
+          data->action == ACTION_LIST_UPDATES) {
         gboolean has_packages = aptkit_process_packages (data->plugin, list, packages, dependencies);
-        if (data->action == ACTION_LIST_UPDATES) {
-          if (!has_packages && data->safe_mode && !data->plugin->tried_safe_mode) {
-            /* If no packages found in safe mode, try without safe mode */
-            data->plugin->tried_safe_mode = TRUE;
-            g_debug ("No updates found in safe mode, trying without safe mode");
+        if (!has_packages && data->safe_mode && !data->plugin->tried_safe_mode) {
+          /* If no packages found in safe mode, try without safe mode */
+          data->plugin->tried_safe_mode = TRUE;
+          g_debug ("No updates found in safe mode, trying without safe mode");
 
-            /* Store needed references before freeing data */
-            GTask *original_task = data->task;
-            GDBusProxy *aptkit_proxy = data->plugin->aptkit_proxy;
-            GCancellable *cancellable = g_task_get_cancellable (original_task);
+          /* Store needed references before freeing data */
+          GTask *original_task = data->task;
+          GDBusProxy *aptkit_proxy = data->plugin->aptkit_proxy;
+          GCancellable *cancellable = g_task_get_cancellable (original_task);
 
-            /* We need to clean up the current transaction before starting a new one */
-            g_signal_handler_disconnect (proxy, data->signal_handler_id);
-            g_object_unref (proxy);
-            g_free (data);
+          /* We need to clean up the current transaction before starting a new one */
+          g_signal_handler_disconnect (proxy, data->signal_handler_id);
+          g_object_unref (proxy);
+          g_free (data);
 
-            /* Try listing updates without safe mode */
-            g_dbus_proxy_call (aptkit_proxy,
-                               "UpgradeSystem",
-                               g_variant_new ("(b)", FALSE), /* safe mode off */
-                               G_DBUS_CALL_FLAGS_NONE,
-                               -1,
-                               cancellable,
-                               aptkit_upgrade_system_cb,
-                               original_task);
-          } else {
-            /* Whether we found packages or not, return the list (which might be empty) */
-            g_task_return_pointer (data->task, g_steal_pointer (&list), g_object_unref);
-            g_signal_handler_disconnect (proxy, data->signal_handler_id);
-            g_object_unref (proxy);
-            g_free (data);
-          }
+          /* Try listing updates without safe mode */
+          g_dbus_proxy_call (aptkit_proxy,
+                             "UpgradeSystem",
+                             g_variant_new ("(b)", FALSE), /* safe mode off */
+                             G_DBUS_CALL_FLAGS_NONE,
+                             -1,
+                             cancellable,
+                             aptkit_upgrade_system_cb,
+                             original_task);
+        } else {
+          /* Whether we found packages or not, return the list (which might be empty) */
+          g_task_return_pointer (data->task, g_steal_pointer (&list), g_object_unref);
+          g_signal_handler_disconnect (proxy, data->signal_handler_id);
+          g_object_unref (proxy);
+          g_free (data);
         }
       }
     }
