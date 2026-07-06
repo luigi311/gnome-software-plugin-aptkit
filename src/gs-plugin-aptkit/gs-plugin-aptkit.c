@@ -24,9 +24,6 @@ struct _GsPluginAptkit
   GDBusProxy *aptkit_proxy;  /* Proxy for Aptkit */
   GsAppList *updatable_apps;  /* List of apps with updates */
   gboolean tried_safe_mode;  /* Flag to track if safe mode has been tried */
-
-  GsPluginProgressCallback current_progress_callback;
-  gpointer current_progress_user_data;
 };
 
 typedef struct {
@@ -34,6 +31,9 @@ typedef struct {
   GsPluginAptkit *plugin;
   TransactionAction action;
   gboolean safe_mode;  /* Flag to indicate if safe mode is enabled */
+  GsPluginProgressCallback progress_callback;  /* Only set for ACTION_UPGRADE_SYSTEM */
+  gpointer progress_user_data;
+  gulong signal_handler_id;
 } TransactionData;
 
 G_DEFINE_TYPE (GsPluginAptkit, gs_plugin_aptkit, GS_TYPE_PLUGIN);
@@ -319,15 +319,16 @@ aptkit_transaction_signal_cb (GDBusProxy *proxy,
                                  GS_PLUGIN_ERROR_FAILED,
                                  "Previous transaction failed");
       }
-      data->plugin->current_progress_callback = NULL;
-      data->plugin->current_progress_user_data = NULL;
+      g_signal_handler_disconnect (proxy, data->signal_handler_id);
       g_object_unref (proxy);
       g_free (data);
     } else if (g_strcmp0 (property_name, "Progress") == 0) {
       gint32 progress;
       g_variant_get (value, "i", &progress);
-      if (data->plugin->current_progress_callback != NULL) {
-        data->plugin->current_progress_callback (GS_PLUGIN (data->plugin), (guint) progress, data->plugin->current_progress_user_data);
+      if (data->progress_callback != NULL) {
+        /* aptkit inherits aptdaemon's 0-101 range, where 101 means indeterminate */
+        guint progress_percent = (progress >= 0 && progress <= 100) ? (guint) progress : GS_APP_PROGRESS_UNKNOWN;
+        data->progress_callback (GS_PLUGIN (data->plugin), progress_percent, data->progress_user_data);
       }
     } else if (g_strcmp0 (property_name, "Packages") == 0 ||
                g_strcmp0 (property_name, "Dependencies") == 0) {
@@ -358,6 +359,7 @@ aptkit_transaction_signal_cb (GDBusProxy *proxy,
             GCancellable *cancellable = g_task_get_cancellable (original_task);
 
             /* We need to clean up the current transaction before starting a new one */
+            g_signal_handler_disconnect (proxy, data->signal_handler_id);
             g_object_unref (proxy);
             g_free (data);
 
@@ -373,6 +375,7 @@ aptkit_transaction_signal_cb (GDBusProxy *proxy,
           } else {
             /* Whether we found packages or not, return the list (which might be empty) */
             g_task_return_pointer (data->task, g_steal_pointer (&list), g_object_unref);
+            g_signal_handler_disconnect (proxy, data->signal_handler_id);
             g_object_unref (proxy);
             g_free (data);
           }
@@ -417,9 +420,16 @@ aptkit_transaction_proxy_updates_cb (GObject *source_object,
   data->action = GPOINTER_TO_INT (g_task_get_task_data (task));
   data->safe_mode = GPOINTER_TO_INT (g_object_get_data (G_OBJECT (task), "safe-mode"));
 
-  g_signal_connect (transaction_proxy, "g-signal",
-                    G_CALLBACK (aptkit_transaction_signal_cb),
-                    data);
+  /* only upgrade transactions report progress; cache refreshes must not
+   * feed into another operation's progress reporting */
+  if (data->action == ACTION_UPGRADE_SYSTEM) {
+    data->progress_callback = (GsPluginProgressCallback) g_object_get_data (G_OBJECT (task), "progress-callback");
+    data->progress_user_data = g_object_get_data (G_OBJECT (task), "progress-user-data");
+  }
+
+  data->signal_handler_id = g_signal_connect (transaction_proxy, "g-signal",
+                                              G_CALLBACK (aptkit_transaction_signal_cb),
+                                              data);
 
   const gchar *method = (data->action == ACTION_LIST_UPDATES) ? "Simulate" : "Run";
   g_debug ("Calling %s on transaction for action %d with safe mode %d",
@@ -676,8 +686,8 @@ gs_plugin_aptkit_update_apps_async (GsPlugin *plugin,
 
   g_task_set_task_data (task, GINT_TO_POINTER (ACTION_UPGRADE_SYSTEM), NULL);
 
-  self->current_progress_callback = progress_callback;
-  self->current_progress_user_data = progress_user_data;
+  g_object_set_data (G_OBJECT (task), "progress-callback", (gpointer) progress_callback);
+  g_object_set_data (G_OBJECT (task), "progress-user-data", progress_user_data);
 
   g_debug ("Starting system update with safe mode %s", safe_mode ? "on" : "off");
   g_dbus_proxy_call (self->aptkit_proxy,
