@@ -846,6 +846,145 @@ gs_plugin_aptkit_adopt_app (GsPlugin *plugin,
 }
 
 static gboolean
+gs_plugin_aptkit_refine_finish (GsPlugin *plugin,
+                                GAsyncResult *result,
+                                GError **error)
+{
+  return g_task_propagate_boolean (G_TASK (result), error);
+}
+
+static void
+aptkit_get_packages_info_cb (GObject *source_object,
+                             GAsyncResult *res,
+                             gpointer user_data)
+{
+  g_autoptr (GTask) task = G_TASK (user_data);
+  GsAppList *list = g_task_get_task_data (task);
+  g_autoptr (GError) error = NULL;
+  g_autoptr (GVariant) result = NULL;
+  g_autoptr (GVariant) infos = NULL;
+  GVariantIter iter;
+  const gchar *name;
+  const gchar *installed_version;
+  const gchar *candidate_version;
+  gboolean known, installed;
+  guint64 download_size, installed_size;
+
+  result = g_dbus_proxy_call_finish (G_DBUS_PROXY (source_object), res, &error);
+  if (result == NULL) {
+    /* an older aptkit without GetPackagesInfo is not fatal, the apps
+     * just stay unrefined */
+    if (g_error_matches (error, G_DBUS_ERROR, G_DBUS_ERROR_UNKNOWN_METHOD)) {
+      g_debug ("GetPackagesInfo not available: %s", error->message);
+      g_task_return_boolean (task, TRUE);
+      return;
+    }
+    g_task_return_error (task, g_steal_pointer (&error));
+    return;
+  }
+
+  infos = g_variant_get_child_value (result, 0);
+  g_variant_iter_init (&iter, infos);
+  while (g_variant_iter_next (&iter, "(&sbb&s&stt)",
+                              &name, &known, &installed,
+                              &installed_version, &candidate_version,
+                              &download_size, &installed_size)) {
+    for (guint i = 0; i < gs_app_list_length (list); i++) {
+      GsApp *app = gs_app_list_index (list, i);
+      guint64 size_tmp;
+
+      if (g_strcmp0 (aptkit_app_get_package_name (app), name) != 0)
+        continue;
+
+      if (gs_app_get_state (app) == GS_APP_STATE_UNKNOWN) {
+        if (!known)
+          gs_app_set_state (app, GS_APP_STATE_UNAVAILABLE);
+        else if (installed)
+          gs_app_set_state (app, GS_APP_STATE_INSTALLED);
+        else if (*candidate_version != '\0')
+          gs_app_set_state (app, GS_APP_STATE_AVAILABLE);
+        else
+          gs_app_set_state (app, GS_APP_STATE_UNAVAILABLE);
+      }
+
+      if (!known)
+        continue;
+
+      if (gs_app_get_metadata_item (app, "aptkit::package-name") == NULL)
+        gs_app_set_metadata (app, "aptkit::package-name", name);
+
+      if (gs_app_get_version (app) == NULL)
+        gs_app_set_version (app, installed ? installed_version : candidate_version);
+
+      if (!installed && download_size > 0 &&
+          gs_app_get_size_download (app, &size_tmp) != GS_SIZE_TYPE_VALID)
+        gs_app_set_size_download (app, GS_SIZE_TYPE_VALID, download_size);
+
+      if (installed_size > 0 &&
+          gs_app_get_size_installed (app, &size_tmp) != GS_SIZE_TYPE_VALID)
+        gs_app_set_size_installed (app, GS_SIZE_TYPE_VALID, installed_size);
+    }
+  }
+
+  g_task_return_boolean (task, TRUE);
+}
+
+static void
+gs_plugin_aptkit_refine_async (GsPlugin *plugin,
+                               GsAppList *list,
+                               GsPluginRefineFlags job_flags,
+                               GsPluginRefineRequireFlags require_flags,
+                               GsPluginEventCallback event_callback,
+                               void *event_user_data,
+                               GCancellable *cancellable,
+                               GAsyncReadyCallback callback,
+                               gpointer user_data)
+{
+  GsPluginAptkit *self = GS_PLUGIN_APTKIT (plugin);
+  g_autoptr (GTask) task = NULL;
+  g_autoptr (GStrvBuilder) builder = g_strv_builder_new ();
+  g_auto (GStrv) package_names = NULL;
+  g_autoptr (GsAppList) relevant = gs_app_list_new ();
+
+  task = g_task_new (plugin, cancellable, callback, user_data);
+  g_task_set_source_tag (task, gs_plugin_aptkit_refine_async);
+
+  for (guint i = 0; i < gs_app_list_length (list); i++) {
+    GsApp *app = gs_app_list_index (list, i);
+    const gchar *package_name;
+
+    if (gs_app_has_quirk (app, GS_APP_QUIRK_IS_WILDCARD))
+      continue;
+    if (!gs_app_has_management_plugin (app, plugin))
+      continue;
+
+    package_name = aptkit_app_get_package_name (app);
+    if (package_name == NULL)
+      continue;
+
+    g_strv_builder_add (builder, package_name);
+    gs_app_list_add (relevant, app);
+  }
+
+  if (gs_app_list_length (relevant) == 0) {
+    g_task_return_boolean (task, TRUE);
+    return;
+  }
+
+  g_task_set_task_data (task, g_steal_pointer (&relevant), g_object_unref);
+
+  package_names = g_strv_builder_end (builder);
+  g_dbus_proxy_call (self->aptkit_proxy,
+                     "GetPackagesInfo",
+                     g_variant_new ("(^as)", package_names),
+                     G_DBUS_CALL_FLAGS_NONE,
+                     -1,
+                     cancellable,
+                     aptkit_get_packages_info_cb,
+                     g_steal_pointer (&task));
+}
+
+static gboolean
 gs_plugin_aptkit_filter_desktop_file_cb (GsPlugin *plugin,
                                          GsApp *app,
                                          const gchar *filename,
@@ -1112,6 +1251,8 @@ gs_plugin_aptkit_class_init (GsPluginAptkitClass *klass)
   object_class->dispose = gs_plugin_aptkit_dispose;
 
   plugin_class->adopt_app = gs_plugin_aptkit_adopt_app;
+  plugin_class->refine_async = gs_plugin_aptkit_refine_async;
+  plugin_class->refine_finish = gs_plugin_aptkit_refine_finish;
   plugin_class->setup_async = gs_plugin_aptkit_setup_async;
   plugin_class->setup_finish = gs_plugin_aptkit_setup_finish;
   plugin_class->refresh_metadata_async = gs_plugin_aptkit_refresh_metadata_async;
