@@ -14,7 +14,9 @@
 typedef enum {
   ACTION_UPDATE_CACHE,
   ACTION_UPGRADE_SYSTEM,
-  ACTION_LIST_UPDATES
+  ACTION_LIST_UPDATES,
+  ACTION_INSTALL_PACKAGES,
+  ACTION_REMOVE_PACKAGES
 } TransactionAction;
 
 struct _GsPluginAptkit
@@ -34,8 +36,9 @@ typedef struct {
   TransactionAction action;
   gboolean safe_mode;  /* Flag to indicate if safe mode is enabled */
   gulong handler_id;   /* Signal handler ID; 0 once the transaction has completed */
-  GsPluginProgressCallback progress_callback;  /* Only set for ACTION_UPGRADE_SYSTEM */
+  GsPluginProgressCallback progress_callback;  /* Not set for cache updates or listings */
   gpointer progress_user_data;
+  GsAppList *apps;     /* (owned) (nullable) apps affected by an install/remove */
 } TransactionData;
 
 G_DEFINE_TYPE (GsPluginAptkit, gs_plugin_aptkit, GS_TYPE_PLUGIN);
@@ -53,6 +56,7 @@ transaction_data_unref (TransactionData *data)
   if (g_atomic_int_dec_and_test (&data->ref_count)) {
     g_clear_object (&data->task);
     g_clear_object (&data->proxy);
+    g_clear_object (&data->apps);
     g_free (data);
   }
 }
@@ -76,18 +80,40 @@ transaction_data_complete (TransactionData *data)
   return TRUE;
 }
 
-/* Restore apps staged as INSTALLING to their previous state after a failed upgrade */
+/* Apps created by this plugin carry the package name as metadata; apps
+ * adopted from appstream carry it as their source */
+static const gchar *
+aptkit_app_get_package_name (GsApp *app)
+{
+  const gchar *package_name = gs_app_get_metadata_item (app, "aptkit::package-name");
+  if (package_name == NULL)
+    package_name = gs_app_get_source_default (app);
+  return package_name;
+}
+
+/* The apps affected by this transaction, or NULL for cache updates and listings */
+static GsAppList *
+transaction_data_get_apps (TransactionData *data)
+{
+  if (data->action == ACTION_UPGRADE_SYSTEM)
+    return data->plugin->updatable_apps;
+  return data->apps;
+}
+
+/* Restore apps staged as INSTALLING/REMOVING to their previous state
+ * after a failed transaction */
 static void
 transaction_data_recover_apps (TransactionData *data)
 {
-  if (data->action != ACTION_UPGRADE_SYSTEM)
+  GsAppList *apps = transaction_data_get_apps (data);
+  if (apps == NULL)
     return;
-  for (guint i = 0; i < gs_app_list_length (data->plugin->updatable_apps); i++)
-    gs_app_set_state_recover (gs_app_list_index (data->plugin->updatable_apps, i));
+  for (guint i = 0; i < gs_app_list_length (apps); i++)
+    gs_app_set_state_recover (gs_app_list_index (apps, i));
 }
 
 static void
-aptkit_upgrade_system_cb (GObject *source_object,
+aptkit_transaction_created_cb (GObject *source_object,
                           GAsyncResult *res,
                           gpointer user_data);
 
@@ -357,6 +383,12 @@ aptkit_transaction_signal_cb (GDBusProxy *proxy,
           gs_plugin_updates_changed (GS_PLUGIN (data->plugin));
         } else if (data->action == ACTION_UPDATE_CACHE) {
           gs_plugin_updates_changed (GS_PLUGIN (data->plugin));
+        } else if (data->action == ACTION_INSTALL_PACKAGES ||
+                   data->action == ACTION_REMOVE_PACKAGES) {
+          GsAppState state = (data->action == ACTION_INSTALL_PACKAGES) ?
+                             GS_APP_STATE_INSTALLED : GS_APP_STATE_AVAILABLE;
+          for (guint i = 0; i < gs_app_list_length (data->apps); i++)
+            gs_app_set_state (gs_app_list_index (data->apps, i), state);
         }
 
         g_task_return_boolean (data->task, TRUE);
@@ -399,11 +431,10 @@ aptkit_transaction_signal_cb (GDBusProxy *proxy,
 
       /* apt transactions are atomic, so the transaction-wide percentage is
        * the per-app progress too */
-      if (data->action == ACTION_UPGRADE_SYSTEM) {
-        for (guint i = 0; i < gs_app_list_length (data->plugin->updatable_apps); i++) {
-          GsApp *app = gs_app_list_index (data->plugin->updatable_apps, i);
-          gs_app_set_progress (app, progress_percent);
-        }
+      GsAppList *apps = transaction_data_get_apps (data);
+      if (apps != NULL) {
+        for (guint i = 0; i < gs_app_list_length (apps); i++)
+          gs_app_set_progress (gs_app_list_index (apps, i), progress_percent);
       }
     } else if (g_strcmp0 (property_name, "ProgressDownload") == 0) {
       const gchar *uri;
@@ -416,12 +447,13 @@ aptkit_transaction_signal_cb (GDBusProxy *proxy,
       g_variant_get (value, "(&s&s&sxx&s)",
                      &uri, &status, &short_desc, &total_size, &partial_size, &msg);
 
-      /* during an upgrade each fetched item is a package and short_desc is
-       * its name, so we can attach real download sizes to the apps */
-      if (data->action == ACTION_UPGRADE_SYSTEM && total_size > 0) {
-        for (guint i = 0; i < gs_app_list_length (data->plugin->updatable_apps); i++) {
-          GsApp *app = gs_app_list_index (data->plugin->updatable_apps, i);
-          if (g_strcmp0 (gs_app_get_metadata_item (app, "aptkit::package-name"), short_desc) == 0) {
+      /* each fetched item is a package and short_desc is its name, so we
+       * can attach real download sizes to the apps */
+      GsAppList *apps = transaction_data_get_apps (data);
+      if (apps != NULL && total_size > 0) {
+        for (guint i = 0; i < gs_app_list_length (apps); i++) {
+          GsApp *app = gs_app_list_index (apps, i);
+          if (g_strcmp0 (aptkit_app_get_package_name (app), short_desc) == 0) {
             gs_app_set_size_download (app, GS_SIZE_TYPE_VALID, (guint64) total_size);
             break;
           }
@@ -462,7 +494,7 @@ aptkit_transaction_signal_cb (GDBusProxy *proxy,
                                  G_DBUS_CALL_FLAGS_NONE,
                                  -1,
                                  g_task_get_cancellable (data->task),
-                                 aptkit_upgrade_system_cb,
+                                 aptkit_transaction_created_cb,
                                  g_object_ref (data->task));
             }
           } else {
@@ -521,11 +553,16 @@ aptkit_transaction_proxy_updates_cb (GObject *source_object,
   data->proxy = transaction_proxy;
   data->task = g_steal_pointer (&task);
 
-  /* only upgrade transactions report progress; cache refreshes must not
-   * feed into another operation's progress reporting */
-  if (data->action == ACTION_UPGRADE_SYSTEM) {
+  /* only upgrade/install/remove transactions report progress; cache
+   * refreshes must not feed into another operation's progress reporting */
+  if (data->action == ACTION_UPGRADE_SYSTEM ||
+      data->action == ACTION_INSTALL_PACKAGES ||
+      data->action == ACTION_REMOVE_PACKAGES) {
+    GsAppList *apps = g_object_get_data (G_OBJECT (data->task), "apps");
     data->progress_callback = (GsPluginProgressCallback) g_object_get_data (G_OBJECT (data->task), "progress-callback");
     data->progress_user_data = g_object_get_data (G_OBJECT (data->task), "progress-user-data");
+    if (apps != NULL)
+      data->apps = g_object_ref (apps);
   }
 
   /* The closure holds its own reference, so a late signal can never see freed data */
@@ -612,7 +649,7 @@ gs_plugin_aptkit_refresh_metadata_async (GsPlugin *plugin,
 }
 
 static void
-aptkit_upgrade_system_cb (GObject *source_object,
+aptkit_transaction_created_cb (GObject *source_object,
                           GAsyncResult *res,
                           gpointer user_data)
 {
@@ -700,7 +737,7 @@ gs_plugin_aptkit_list_apps_async (GsPlugin *plugin,
                        G_DBUS_CALL_FLAGS_NONE,
                        -1,
                        cancellable,
-                       aptkit_upgrade_system_cb,
+                       aptkit_transaction_created_cb,
                        g_steal_pointer (&task));
   } else {
     g_task_return_new_error (task, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED,
@@ -822,8 +859,139 @@ gs_plugin_aptkit_update_apps_async (GsPlugin *plugin,
                      G_DBUS_CALL_FLAGS_NONE,
                      -1,
                      cancellable,
-                     aptkit_upgrade_system_cb,
+                     aptkit_transaction_created_cb,
                      g_steal_pointer (&task));
+}
+
+/* Shared implementation for install_apps and uninstall_apps */
+static void
+gs_plugin_aptkit_apps_op_async (GsPlugin *plugin,
+                                GsAppList *apps,
+                                TransactionAction action,
+                                GsPluginProgressCallback progress_callback,
+                                gpointer progress_user_data,
+                                GCancellable *cancellable,
+                                GAsyncReadyCallback callback,
+                                gpointer user_data,
+                                gpointer source_tag)
+{
+  GsPluginAptkit *self = GS_PLUGIN_APTKIT (plugin);
+  g_autoptr(GTask) task = NULL;
+  g_autoptr(GsAppList) managed = gs_app_list_new ();
+  g_autoptr(GStrvBuilder) builder = g_strv_builder_new ();
+  g_auto(GStrv) package_names = NULL;
+  GsAppState state = (action == ACTION_INSTALL_PACKAGES) ?
+                     GS_APP_STATE_INSTALLING : GS_APP_STATE_REMOVING;
+  const gchar *method = (action == ACTION_INSTALL_PACKAGES) ?
+                        "InstallPackages" : "RemovePackages";
+
+  task = g_task_new (plugin, cancellable, callback, user_data);
+  g_task_set_source_tag (task, source_tag);
+
+  for (guint i = 0; i < gs_app_list_length (apps); i++) {
+    GsApp *app = gs_app_list_index (apps, i);
+    const gchar *package_name;
+
+    /* only handle apps this plugin manages */
+    if (!gs_app_has_management_plugin (app, plugin))
+      continue;
+
+    package_name = aptkit_app_get_package_name (app);
+    if (package_name == NULL)
+      continue;
+
+    g_strv_builder_add (builder, package_name);
+    gs_app_list_add (managed, app);
+  }
+
+  if (gs_app_list_length (managed) == 0) {
+    g_task_return_boolean (task, TRUE);
+    return;
+  }
+
+  for (guint i = 0; i < gs_app_list_length (managed); i++)
+    gs_app_set_state (gs_app_list_index (managed, i), state);
+
+  g_task_set_task_data (task, GINT_TO_POINTER (action), NULL);
+  g_object_set_data_full (G_OBJECT (task), "apps",
+                          g_steal_pointer (&managed), g_object_unref);
+  g_object_set_data (G_OBJECT (task), "progress-callback", (gpointer) progress_callback);
+  g_object_set_data (G_OBJECT (task), "progress-user-data", progress_user_data);
+
+  package_names = g_strv_builder_end (builder);
+  g_debug ("Calling %s", method);
+  g_dbus_proxy_call (self->aptkit_proxy,
+                     method,
+                     g_variant_new ("(^as)", package_names),
+                     G_DBUS_CALL_FLAGS_NONE,
+                     -1,
+                     cancellable,
+                     aptkit_transaction_created_cb,
+                     g_steal_pointer (&task));
+}
+
+static gboolean
+gs_plugin_aptkit_install_apps_finish (GsPlugin *plugin,
+                                      GAsyncResult *result,
+                                      GError **error)
+{
+  return g_task_propagate_boolean (G_TASK (result), error);
+}
+
+static void
+gs_plugin_aptkit_install_apps_async (GsPlugin *plugin,
+                                     GsAppList *apps,
+                                     GsPluginInstallAppsFlags flags,
+                                     GsPluginProgressCallback progress_callback,
+                                     gpointer progress_user_data,
+                                     GsPluginEventCallback event_callback,
+                                     void *event_user_data,
+                                     GsPluginAppNeedsUserActionCallback app_needs_user_action_callback,
+                                     gpointer app_needs_user_action_data,
+                                     GCancellable *cancellable,
+                                     GAsyncReadyCallback callback,
+                                     gpointer user_data)
+{
+  if (flags & GS_PLUGIN_INSTALL_APPS_FLAGS_NO_APPLY) {
+    /* aptkit has no download-only mode */
+    g_autoptr(GTask) task = g_task_new (plugin, cancellable, callback, user_data);
+    g_task_set_source_tag (task, gs_plugin_aptkit_install_apps_async);
+    g_task_return_boolean (task, TRUE);
+    return;
+  }
+
+  gs_plugin_aptkit_apps_op_async (plugin, apps, ACTION_INSTALL_PACKAGES,
+                                  progress_callback, progress_user_data,
+                                  cancellable, callback, user_data,
+                                  gs_plugin_aptkit_install_apps_async);
+}
+
+static gboolean
+gs_plugin_aptkit_uninstall_apps_finish (GsPlugin *plugin,
+                                        GAsyncResult *result,
+                                        GError **error)
+{
+  return g_task_propagate_boolean (G_TASK (result), error);
+}
+
+static void
+gs_plugin_aptkit_uninstall_apps_async (GsPlugin *plugin,
+                                       GsAppList *apps,
+                                       GsPluginUninstallAppsFlags flags,
+                                       GsPluginProgressCallback progress_callback,
+                                       gpointer progress_user_data,
+                                       GsPluginEventCallback event_callback,
+                                       void *event_user_data,
+                                       GsPluginAppNeedsUserActionCallback app_needs_user_action_callback,
+                                       gpointer app_needs_user_action_data,
+                                       GCancellable *cancellable,
+                                       GAsyncReadyCallback callback,
+                                       gpointer user_data)
+{
+  gs_plugin_aptkit_apps_op_async (plugin, apps, ACTION_REMOVE_PACKAGES,
+                                  progress_callback, progress_user_data,
+                                  cancellable, callback, user_data,
+                                  gs_plugin_aptkit_uninstall_apps_async);
 }
 
 static void
@@ -868,6 +1036,10 @@ gs_plugin_aptkit_class_init (GsPluginAptkitClass *klass)
   plugin_class->launch_finish = gs_plugin_aptkit_launch_finish;
   plugin_class->update_apps_async = gs_plugin_aptkit_update_apps_async;
   plugin_class->update_apps_finish = gs_plugin_aptkit_update_apps_finish;
+  plugin_class->install_apps_async = gs_plugin_aptkit_install_apps_async;
+  plugin_class->install_apps_finish = gs_plugin_aptkit_install_apps_finish;
+  plugin_class->uninstall_apps_async = gs_plugin_aptkit_uninstall_apps_async;
+  plugin_class->uninstall_apps_finish = gs_plugin_aptkit_uninstall_apps_finish;
 }
 
 GType
