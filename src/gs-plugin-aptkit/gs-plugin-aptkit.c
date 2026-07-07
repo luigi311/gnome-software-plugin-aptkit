@@ -36,6 +36,7 @@ typedef struct {
   TransactionAction action;
   gboolean safe_mode;  /* Flag to indicate if safe mode is enabled */
   gulong handler_id;   /* Signal handler ID; 0 once the transaction has completed */
+  gulong cancelled_id;  /* GCancellable handler ID, or 0 */
   GsPluginProgressCallback progress_callback;  /* Not set for cache updates or listings */
   gpointer progress_user_data;
   GsAppList *apps;     /* (owned) (nullable) apps affected by an install/remove */
@@ -72,6 +73,25 @@ transaction_data_closure_unref (gpointer user_data,
   transaction_data_unref (user_data);
 }
 
+/* Ask the daemon to cancel the transaction; completion still arrives
+ * through the ExitState signal (exit-cancelled) */
+static void
+aptkit_transaction_cancelled_cb (GCancellable *cancellable,
+                                 gpointer user_data)
+{
+  TransactionData *data = (TransactionData *)user_data;
+
+  g_debug ("Cancelling transaction");
+  g_dbus_proxy_call (data->proxy,
+                     "Cancel",
+                     g_variant_new ("()"),
+                     G_DBUS_CALL_FLAGS_NONE,
+                     -1,
+                     NULL,
+                     NULL,
+                     NULL);
+}
+
 /* Mark the transaction as completed and disconnect the signal handler.
  * Returns FALSE if another callback already completed it. */
 static gboolean
@@ -79,6 +99,11 @@ transaction_data_complete (TransactionData *data)
 {
   if (data->handler_id == 0)
     return FALSE;
+  if (data->cancelled_id != 0) {
+    g_cancellable_disconnect (g_task_get_cancellable (data->task),
+                              data->cancelled_id);
+    data->cancelled_id = 0;
+  }
   g_signal_handler_disconnect (data->proxy, data->handler_id);
   data->handler_id = 0;
   return TRUE;
@@ -448,6 +473,15 @@ aptkit_transaction_signal_cb (GDBusProxy *proxy,
                                  GS_PLUGIN_ERROR_FAILED,
                                  "Unknown exit state: %s", exit_state);
       }
+    } else if (g_strcmp0 (property_name, "Cancellable") == 0) {
+      gboolean can_cancel;
+      GsAppList *apps = transaction_data_get_apps (data);
+
+      g_variant_get (value, "b", &can_cancel);
+      if (apps != NULL) {
+        for (guint i = 0; i < gs_app_list_length (apps); i++)
+          gs_app_set_allow_cancel (gs_app_list_index (apps, i), can_cancel);
+      }
     } else if (g_strcmp0 (property_name, "Error") == 0) {
       const gchar *code;
       const gchar *details;
@@ -615,6 +649,14 @@ aptkit_transaction_proxy_updates_cb (GObject *source_object,
                                             transaction_data_ref (data),
                                             transaction_data_closure_unref,
                                             0);
+
+  /* Forward cancellation to the daemon; the handler holds its own reference */
+  if (g_task_get_cancellable (data->task) != NULL) {
+    data->cancelled_id = g_cancellable_connect (g_task_get_cancellable (data->task),
+                                                G_CALLBACK (aptkit_transaction_cancelled_cb),
+                                                transaction_data_ref (data),
+                                                (GDestroyNotify) transaction_data_unref);
+  }
 
   const gchar *method = (data->action == ACTION_LIST_UPDATES) ? "Simulate" : "Run";
   g_debug ("Calling %s on transaction for action %d with safe mode %d",
