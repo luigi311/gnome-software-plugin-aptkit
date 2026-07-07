@@ -27,13 +27,52 @@ struct _GsPluginAptkit
 };
 
 typedef struct {
-  GTask *task;
+  gint ref_count;      /* Shared by the signal-handler closure and the Run/Simulate reply callback */
+  GTask *task;         /* (owned) */
+  GDBusProxy *proxy;   /* (owned) proxy for the transaction object */
   GsPluginAptkit *plugin;
   TransactionAction action;
   gboolean safe_mode;  /* Flag to indicate if safe mode is enabled */
+  gulong handler_id;   /* Signal handler ID; 0 once the transaction has completed */
 } TransactionData;
 
 G_DEFINE_TYPE (GsPluginAptkit, gs_plugin_aptkit, GS_TYPE_PLUGIN);
+
+static TransactionData *
+transaction_data_ref (TransactionData *data)
+{
+  g_atomic_int_inc (&data->ref_count);
+  return data;
+}
+
+static void
+transaction_data_unref (TransactionData *data)
+{
+  if (g_atomic_int_dec_and_test (&data->ref_count)) {
+    g_clear_object (&data->task);
+    g_clear_object (&data->proxy);
+    g_free (data);
+  }
+}
+
+static void
+transaction_data_closure_unref (gpointer user_data,
+                                GClosure *closure)
+{
+  transaction_data_unref (user_data);
+}
+
+/* Mark the transaction as completed and disconnect the signal handler.
+ * Returns FALSE if another callback already completed it. */
+static gboolean
+transaction_data_complete (TransactionData *data)
+{
+  if (data->handler_id == 0)
+    return FALSE;
+  g_signal_handler_disconnect (data->proxy, data->handler_id);
+  data->handler_id = 0;
+  return TRUE;
+}
 
 static void
 aptkit_upgrade_system_cb (GObject *source_object,
@@ -288,6 +327,9 @@ aptkit_transaction_signal_cb (GDBusProxy *proxy,
         return;
       }
 
+      if (!transaction_data_complete (data))
+        return;
+
       if (g_strcmp0 (exit_state, "exit-success") == 0) {
         /* we only need to emit updates changed on cache update or system upgrade */
         if (data->action == ACTION_UPGRADE_SYSTEM) {
@@ -328,8 +370,6 @@ aptkit_transaction_signal_cb (GDBusProxy *proxy,
                                  GS_PLUGIN_ERROR_FAILED,
                                  "Unknown exit state: %s", exit_state);
       }
-      g_object_unref (proxy);
-      g_free (data);
     } else if (g_strcmp0 (property_name, "Packages") == 0 ||
                g_strcmp0 (property_name, "Dependencies") == 0) {
       g_autoptr(GVariant) packages = NULL;
@@ -355,29 +395,23 @@ aptkit_transaction_signal_cb (GDBusProxy *proxy,
             data->plugin->tried_safe_mode = TRUE;
             g_debug ("No updates found in safe mode, trying without safe mode");
 
-            /* Store needed references before freeing data */
-            GTask *original_task = data->task;
-            GDBusProxy *aptkit_proxy = data->plugin->aptkit_proxy;
-            GCancellable *cancellable = g_task_get_cancellable (original_task);
-
-            /* We need to clean up the current transaction before starting a new one */
-            g_object_unref (proxy);
-            g_free (data);
-
-            /* Try listing updates without safe mode */
-            g_dbus_proxy_call (aptkit_proxy,
-                               "UpgradeSystem",
-                               g_variant_new ("(b)", FALSE), /* safe mode off */
-                               G_DBUS_CALL_FLAGS_NONE,
-                               -1,
-                               cancellable,
-                               aptkit_upgrade_system_cb,
-                               original_task);
+            /* Finish this transaction and retry without safe mode; the new
+             * call chain takes its own reference on the task */
+            if (transaction_data_complete (data)) {
+              g_object_set_data (G_OBJECT (data->task), "safe-mode", GINT_TO_POINTER (FALSE));
+              g_dbus_proxy_call (data->plugin->aptkit_proxy,
+                                 "UpgradeSystem",
+                                 g_variant_new ("(b)", FALSE), /* safe mode off */
+                                 G_DBUS_CALL_FLAGS_NONE,
+                                 -1,
+                                 g_task_get_cancellable (data->task),
+                                 aptkit_upgrade_system_cb,
+                                 g_object_ref (data->task));
+            }
           } else {
             /* Whether we found packages or not, return the list (which might be empty) */
-            g_task_return_pointer (data->task, g_steal_pointer (&list), g_object_unref);
-            g_object_unref (proxy);
-            g_free (data);
+            if (transaction_data_complete (data))
+              g_task_return_pointer (data->task, g_steal_pointer (&list), g_object_unref);
           }
         }
       }
@@ -390,12 +424,18 @@ aptkit_transaction_run_cb (GObject *source_object,
                            GAsyncResult *res,
                            gpointer user_data)
 {
+  TransactionData *data = (TransactionData *)user_data;
   g_autoptr (GError) error = NULL;
   g_autoptr (GVariant) result = NULL;
 
   result = g_dbus_proxy_call_finish (G_DBUS_PROXY (source_object), res, &error);
-  if (result == NULL)
+  if (result == NULL) {
     g_warning ("Failed to run transaction: %s", error->message);
+    if (transaction_data_complete (data))
+      g_task_return_error (data->task, g_steal_pointer (&error));
+  }
+
+  transaction_data_unref (data);
 }
 
 static void
@@ -403,7 +443,7 @@ aptkit_transaction_proxy_updates_cb (GObject *source_object,
                                      GAsyncResult *res,
                                      gpointer user_data)
 {
-  GTask *task = G_TASK (user_data);
+  g_autoptr (GTask) task = G_TASK (user_data);
   g_autoptr (GError) error = NULL;
   GDBusProxy *transaction_proxy;
   TransactionData *data;
@@ -415,27 +455,33 @@ aptkit_transaction_proxy_updates_cb (GObject *source_object,
   }
 
   data = g_new0 (TransactionData, 1);
-  data->task = task;
+  data->ref_count = 1;
   data->plugin = GS_PLUGIN_APTKIT (g_task_get_source_object (task));
   data->action = GPOINTER_TO_INT (g_task_get_task_data (task));
   data->safe_mode = GPOINTER_TO_INT (g_object_get_data (G_OBJECT (task), "safe-mode"));
+  data->proxy = transaction_proxy;
+  data->task = g_steal_pointer (&task);
 
-  g_signal_connect (transaction_proxy, "g-signal",
-                    G_CALLBACK (aptkit_transaction_signal_cb),
-                    data);
+  /* The closure holds its own reference, so a late signal can never see freed data */
+  data->handler_id = g_signal_connect_data (data->proxy, "g-signal",
+                                            G_CALLBACK (aptkit_transaction_signal_cb),
+                                            transaction_data_ref (data),
+                                            transaction_data_closure_unref,
+                                            0);
 
   const gchar *method = (data->action == ACTION_LIST_UPDATES) ? "Simulate" : "Run";
   g_debug ("Calling %s on transaction for action %d with safe mode %d",
            method, data->action, data->safe_mode);
 
-  g_dbus_proxy_call (transaction_proxy,
+  /* The reply callback owns the creation reference */
+  g_dbus_proxy_call (data->proxy,
                      method,
                      g_variant_new ("()"),
                      G_DBUS_CALL_FLAGS_NONE,
                      -1,
-                     g_task_get_cancellable (task),
+                     g_task_get_cancellable (data->task),
                      aptkit_transaction_run_cb,
-                     NULL);
+                     data);
 }
 
 static void
@@ -443,8 +489,9 @@ aptkit_update_cache_cb (GObject *source_object,
                         GAsyncResult *res,
                         gpointer user_data)
 {
-  GTask *task = G_TASK (user_data);
+  g_autoptr (GTask) task = G_TASK (user_data);
   GsPluginAptkit *self = GS_PLUGIN_APTKIT (g_task_get_source_object (task));
+  GCancellable *cancellable = g_task_get_cancellable (task);
   g_autoptr (GError) error = NULL;
   g_autoptr (GVariant) result = NULL;
   const gchar *transaction_path;
@@ -465,9 +512,9 @@ aptkit_update_cache_cb (GObject *source_object,
                     "org.aptkit",
                     transaction_path,
                     "org.aptkit.transaction",
-                    g_task_get_cancellable (task),
+                    cancellable,
                     aptkit_transaction_proxy_updates_cb,
-                    task);
+                    g_steal_pointer (&task));
 }
 
 static void
@@ -503,8 +550,9 @@ aptkit_upgrade_system_cb (GObject *source_object,
                           GAsyncResult *res,
                           gpointer user_data)
 {
-  GTask *task = G_TASK (user_data);
+  g_autoptr (GTask) task = G_TASK (user_data);
   GsPluginAptkit *self = GS_PLUGIN_APTKIT (g_task_get_source_object (task));
+  GCancellable *cancellable = g_task_get_cancellable (task);
   g_autoptr (GError) error = NULL;
   g_autoptr (GVariant) result = NULL;
   const gchar *transaction_path;
@@ -524,9 +572,9 @@ aptkit_upgrade_system_cb (GObject *source_object,
                     "org.aptkit",
                     transaction_path,
                     "org.aptkit.transaction",
-                    g_task_get_cancellable (task),
+                    cancellable,
                     aptkit_transaction_proxy_updates_cb,
-                    task);
+                    g_steal_pointer (&task));
 }
 
 static GsAppList *
