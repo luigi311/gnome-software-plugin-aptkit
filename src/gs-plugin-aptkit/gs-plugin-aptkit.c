@@ -39,6 +39,8 @@ typedef struct {
   GsPluginProgressCallback progress_callback;  /* Not set for cache updates or listings */
   gpointer progress_user_data;
   GsAppList *apps;     /* (owned) (nullable) apps affected by an install/remove */
+  gchar *error_code;   /* (owned) (nullable) apt error enum from the Error property */
+  gchar *error_details;  /* (owned) (nullable) human-readable error details */
 } TransactionData;
 
 G_DEFINE_TYPE (GsPluginAptkit, gs_plugin_aptkit, GS_TYPE_PLUGIN);
@@ -57,6 +59,8 @@ transaction_data_unref (TransactionData *data)
     g_clear_object (&data->task);
     g_clear_object (&data->proxy);
     g_clear_object (&data->apps);
+    g_free (data->error_code);
+    g_free (data->error_details);
     g_free (data);
   }
 }
@@ -80,6 +84,30 @@ transaction_data_complete (TransactionData *data)
   return TRUE;
 }
 
+/* Map aptkit's error enum strings to GsPluginError codes */
+static GsPluginError
+aptkit_error_code_to_gs_error (const gchar *code)
+{
+  if (code == NULL)
+    return GS_PLUGIN_ERROR_FAILED;
+  if (g_str_equal (code, "error-package-download-failed") ||
+      g_str_equal (code, "error-repo-download-failed") ||
+      g_str_equal (code, "error-license-key-download-failed"))
+    return GS_PLUGIN_ERROR_DOWNLOAD_FAILED;
+  if (g_str_equal (code, "error-dep-resolution-failed") ||
+      g_str_equal (code, "error-cache-broken"))
+    return GS_PLUGIN_ERROR_PLUGIN_DEPSOLVE_FAILED;
+  if (g_str_equal (code, "error-not-authorized"))
+    return GS_PLUGIN_ERROR_AUTH_REQUIRED;
+  if (g_str_equal (code, "error-auth-failed"))
+    return GS_PLUGIN_ERROR_AUTH_INVALID;
+  if (g_str_equal (code, "error-package-unauthenticated"))
+    return GS_PLUGIN_ERROR_NO_SECURITY;
+  if (g_str_equal (code, "error-not-supported"))
+    return GS_PLUGIN_ERROR_NOT_SUPPORTED;
+  return GS_PLUGIN_ERROR_FAILED;
+}
+
 /* Apps created by this plugin carry the package name as metadata; apps
  * adopted from appstream carry it as their source */
 static const gchar *
@@ -87,7 +115,7 @@ aptkit_app_get_package_name (GsApp *app)
 {
   const gchar *package_name = gs_app_get_metadata_item (app, "aptkit::package-name");
   if (package_name == NULL)
-    package_name = gs_app_get_source_default (app);
+    package_name = gs_app_get_default_source (app);
   return package_name;
 }
 
@@ -402,8 +430,10 @@ aptkit_transaction_signal_cb (GDBusProxy *proxy,
         transaction_data_recover_apps (data);
         g_task_return_new_error (data->task,
                                  GS_PLUGIN_ERROR,
-                                 GS_PLUGIN_ERROR_FAILED,
-                                 "Transaction failed");
+                                 aptkit_error_code_to_gs_error (data->error_code),
+                                 "%s",
+                                 (data->error_details != NULL && *data->error_details != '\0') ?
+                                 data->error_details : "Transaction failed");
       } else if (g_strcmp0 (exit_state, "exit-previous-failed") == 0) {
         transaction_data_recover_apps (data);
         g_task_return_new_error (data->task,
@@ -417,6 +447,20 @@ aptkit_transaction_signal_cb (GDBusProxy *proxy,
                                  GS_PLUGIN_ERROR,
                                  GS_PLUGIN_ERROR_FAILED,
                                  "Unknown exit state: %s", exit_state);
+      }
+    } else if (g_strcmp0 (property_name, "Error") == 0) {
+      const gchar *code;
+      const gchar *details;
+
+      /* stash the error; it arrives before the ExitState change that
+       * completes the task */
+      g_variant_get (value, "(&s&s)", &code, &details);
+      if (*code != '\0') {
+        g_debug ("Transaction error: %s: %s", code, details);
+        g_free (data->error_code);
+        g_free (data->error_details);
+        data->error_code = g_strdup (code);
+        data->error_details = g_strdup (details);
       }
     } else if (g_strcmp0 (property_name, "Progress") == 0) {
       gint32 progress;
