@@ -34,6 +34,8 @@ typedef struct {
   TransactionAction action;
   gboolean safe_mode;  /* Flag to indicate if safe mode is enabled */
   gulong handler_id;   /* Signal handler ID; 0 once the transaction has completed */
+  GsPluginProgressCallback progress_callback;  /* Only set for ACTION_UPGRADE_SYSTEM */
+  gpointer progress_user_data;
 } TransactionData;
 
 G_DEFINE_TYPE (GsPluginAptkit, gs_plugin_aptkit, GS_TYPE_PLUGIN);
@@ -384,6 +386,47 @@ aptkit_transaction_signal_cb (GDBusProxy *proxy,
                                  GS_PLUGIN_ERROR_FAILED,
                                  "Unknown exit state: %s", exit_state);
       }
+    } else if (g_strcmp0 (property_name, "Progress") == 0) {
+      gint32 progress;
+      guint progress_percent;
+
+      g_variant_get (value, "i", &progress);
+      /* aptkit inherits aptdaemon's 0-101 range, where 101 means indeterminate */
+      progress_percent = (progress >= 0 && progress <= 100) ? (guint) progress : GS_APP_PROGRESS_UNKNOWN;
+
+      if (data->progress_callback != NULL)
+        data->progress_callback (GS_PLUGIN (data->plugin), progress_percent, data->progress_user_data);
+
+      /* apt transactions are atomic, so the transaction-wide percentage is
+       * the per-app progress too */
+      if (data->action == ACTION_UPGRADE_SYSTEM) {
+        for (guint i = 0; i < gs_app_list_length (data->plugin->updatable_apps); i++) {
+          GsApp *app = gs_app_list_index (data->plugin->updatable_apps, i);
+          gs_app_set_progress (app, progress_percent);
+        }
+      }
+    } else if (g_strcmp0 (property_name, "ProgressDownload") == 0) {
+      const gchar *uri;
+      const gchar *status;
+      const gchar *short_desc;
+      const gchar *msg;
+      gint64 total_size;
+      gint64 partial_size;
+
+      g_variant_get (value, "(&s&s&sxx&s)",
+                     &uri, &status, &short_desc, &total_size, &partial_size, &msg);
+
+      /* during an upgrade each fetched item is a package and short_desc is
+       * its name, so we can attach real download sizes to the apps */
+      if (data->action == ACTION_UPGRADE_SYSTEM && total_size > 0) {
+        for (guint i = 0; i < gs_app_list_length (data->plugin->updatable_apps); i++) {
+          GsApp *app = gs_app_list_index (data->plugin->updatable_apps, i);
+          if (g_strcmp0 (gs_app_get_metadata_item (app, "aptkit::package-name"), short_desc) == 0) {
+            gs_app_set_size_download (app, GS_SIZE_TYPE_VALID, (guint64) total_size);
+            break;
+          }
+        }
+      }
     } else if (g_strcmp0 (property_name, "Packages") == 0 ||
                g_strcmp0 (property_name, "Dependencies") == 0) {
       g_autoptr(GVariant) packages = NULL;
@@ -477,6 +520,13 @@ aptkit_transaction_proxy_updates_cb (GObject *source_object,
   data->safe_mode = GPOINTER_TO_INT (g_object_get_data (G_OBJECT (task), "safe-mode"));
   data->proxy = transaction_proxy;
   data->task = g_steal_pointer (&task);
+
+  /* only upgrade transactions report progress; cache refreshes must not
+   * feed into another operation's progress reporting */
+  if (data->action == ACTION_UPGRADE_SYSTEM) {
+    data->progress_callback = (GsPluginProgressCallback) g_object_get_data (G_OBJECT (data->task), "progress-callback");
+    data->progress_user_data = g_object_get_data (G_OBJECT (data->task), "progress-user-data");
+  }
 
   /* The closure holds its own reference, so a late signal can never see freed data */
   data->handler_id = g_signal_connect_data (data->proxy, "g-signal",
@@ -747,6 +797,9 @@ gs_plugin_aptkit_update_apps_async (GsPlugin *plugin,
   }
 
   g_task_set_task_data (task, GINT_TO_POINTER (ACTION_UPGRADE_SYSTEM), NULL);
+
+  g_object_set_data (G_OBJECT (task), "progress-callback", (gpointer) progress_callback);
+  g_object_set_data (G_OBJECT (task), "progress-user-data", progress_user_data);
 
   g_debug ("Starting system update with safe mode %s", safe_mode ? "on" : "off");
   g_dbus_proxy_call (self->aptkit_proxy,
