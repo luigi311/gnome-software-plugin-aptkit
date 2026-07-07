@@ -845,6 +845,25 @@ gs_plugin_aptkit_adopt_app (GsPlugin *plugin,
   }
 }
 
+/* TRUE if the app declares touch support in any relation
+ * (requires/recommends/supports) */
+static gboolean
+aptkit_app_declares_touch (GsApp *app)
+{
+  GPtrArray *relations = gs_app_get_relations (app);
+
+  if (relations == NULL)
+    return FALSE;
+
+  for (guint i = 0; i < relations->len; i++) {
+    AsRelation *relation = g_ptr_array_index (relations, i);
+    if (as_relation_get_item_kind (relation) == AS_RELATION_ITEM_KIND_CONTROL &&
+        as_relation_get_value_control_kind (relation) == AS_CONTROL_KIND_TOUCH)
+      return TRUE;
+  }
+  return FALSE;
+}
+
 static gboolean
 gs_plugin_aptkit_refine_finish (GsPlugin *plugin,
                                 GAsyncResult *result,
@@ -924,6 +943,19 @@ aptkit_get_packages_info_cb (GObject *source_object,
           gs_app_get_size_installed (app, &size_tmp) != GS_SIZE_TYPE_VALID)
         gs_app_set_size_installed (app, GS_SIZE_TYPE_VALID, installed_size);
     }
+  }
+
+  /* This is a mobile-only store: hide catalog candidates that do not
+   * declare touch support. Installed and updatable apps are exempt so
+   * they never disappear from the Installed/Updates pages. */
+  for (guint i = 0; i < gs_app_list_length (list); i++) {
+    GsApp *app = gs_app_list_index (list, i);
+    GsAppState state = gs_app_get_state (app);
+
+    if (state != GS_APP_STATE_AVAILABLE && state != GS_APP_STATE_UNAVAILABLE)
+      continue;
+    if (!aptkit_app_declares_touch (app))
+      gs_app_add_quirk (app, GS_APP_QUIRK_HIDE_EVERYWHERE);
   }
 
   g_task_return_boolean (task, TRUE);
@@ -1226,6 +1258,9 @@ gs_plugin_aptkit_init (GsPluginAptkit *self)
 
   gs_plugin_add_rule (plugin, GS_PLUGIN_RULE_RUN_BEFORE, "icons");
   gs_plugin_add_rule (plugin, GS_PLUGIN_RULE_RUN_BEFORE, "generic-updates");
+  /* the touch-support filter in refine reads relations that the
+   * appstream plugin populates */
+  gs_plugin_add_rule (plugin, GS_PLUGIN_RULE_RUN_AFTER, "appstream");
 
   self->updatable_apps = gs_app_list_new ();
   self->tried_safe_mode = FALSE;
