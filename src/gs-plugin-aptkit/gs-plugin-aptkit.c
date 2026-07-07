@@ -74,6 +74,16 @@ transaction_data_complete (TransactionData *data)
   return TRUE;
 }
 
+/* Restore apps staged as INSTALLING to their previous state after a failed upgrade */
+static void
+transaction_data_recover_apps (TransactionData *data)
+{
+  if (data->action != ACTION_UPGRADE_SYSTEM)
+    return;
+  for (guint i = 0; i < gs_app_list_length (data->plugin->updatable_apps); i++)
+    gs_app_set_state_recover (gs_app_list_index (data->plugin->updatable_apps, i));
+}
+
 static void
 aptkit_upgrade_system_cb (GObject *source_object,
                           GAsyncResult *res,
@@ -349,22 +359,26 @@ aptkit_transaction_signal_cb (GDBusProxy *proxy,
 
         g_task_return_boolean (data->task, TRUE);
       } else if (g_strcmp0 (exit_state, "exit-cancelled") == 0) {
+        transaction_data_recover_apps (data);
         g_task_return_new_error (data->task,
                                  GS_PLUGIN_ERROR,
                                  GS_PLUGIN_ERROR_CANCELLED,
                                  "Transaction was cancelled");
       } else if (g_strcmp0 (exit_state, "exit-failed") == 0) {
+        transaction_data_recover_apps (data);
         g_task_return_new_error (data->task,
                                  GS_PLUGIN_ERROR,
                                  GS_PLUGIN_ERROR_FAILED,
                                  "Transaction failed");
       } else if (g_strcmp0 (exit_state, "exit-previous-failed") == 0) {
+        transaction_data_recover_apps (data);
         g_task_return_new_error (data->task,
                                  GS_PLUGIN_ERROR,
                                  GS_PLUGIN_ERROR_FAILED,
                                  "Previous transaction failed");
       } else {
         g_warning ("Unknown exit state: %s", exit_state);
+        transaction_data_recover_apps (data);
         g_task_return_new_error (data->task,
                                  GS_PLUGIN_ERROR,
                                  GS_PLUGIN_ERROR_FAILED,
@@ -431,8 +445,10 @@ aptkit_transaction_run_cb (GObject *source_object,
   result = g_dbus_proxy_call_finish (G_DBUS_PROXY (source_object), res, &error);
   if (result == NULL) {
     g_warning ("Failed to run transaction: %s", error->message);
-    if (transaction_data_complete (data))
+    if (transaction_data_complete (data)) {
+      transaction_data_recover_apps (data);
       g_task_return_error (data->task, g_steal_pointer (&error));
+    }
   }
 
   transaction_data_unref (data);
