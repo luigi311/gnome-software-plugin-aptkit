@@ -708,6 +708,20 @@ gs_plugin_aptkit_list_apps_async (GsPlugin *plugin,
   }
 }
 
+static void
+gs_plugin_aptkit_adopt_app (GsPlugin *plugin,
+                            GsApp *app)
+{
+  /* Claim deb apps discovered by other plugins (e.g. appstream) so
+   * install/remove/update operations are routed to us */
+  if (gs_app_get_bundle_kind (app) == AS_BUNDLE_KIND_PACKAGE &&
+      gs_app_get_scope (app) == AS_COMPONENT_SCOPE_SYSTEM) {
+    gs_app_set_management_plugin (app, plugin);
+    if (gs_app_get_metadata_item (app, "GnomeSoftware::PackagingFormat") == NULL)
+      gs_app_set_metadata (app, "GnomeSoftware::PackagingFormat", "deb");
+  }
+}
+
 static gboolean
 gs_plugin_aptkit_filter_desktop_file_cb (GsPlugin *plugin,
                                          GsApp *app,
@@ -843,6 +857,7 @@ gs_plugin_aptkit_class_init (GsPluginAptkitClass *klass)
 
   object_class->dispose = gs_plugin_aptkit_dispose;
 
+  plugin_class->adopt_app = gs_plugin_aptkit_adopt_app;
   plugin_class->setup_async = gs_plugin_aptkit_setup_async;
   plugin_class->setup_finish = gs_plugin_aptkit_setup_finish;
   plugin_class->refresh_metadata_async = gs_plugin_aptkit_refresh_metadata_async;
