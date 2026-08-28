@@ -14,7 +14,8 @@
 typedef enum {
   ACTION_UPDATE_CACHE,
   ACTION_UPGRADE_SYSTEM,
-  ACTION_LIST_UPDATES
+  ACTION_LIST_UPDATES,
+  ACTION_FIX_BROKEN_DEPENDS
 } TransactionAction;
 
 struct _GsPluginAptkit
@@ -283,6 +284,34 @@ aptkit_transaction_signal_cb (GDBusProxy *proxy,
       g_debug ("Exit state changed to: %s", exit_state);
 
       if (g_strcmp0 (exit_state, "exit-success") == 0) {
+        if (data->action == ACTION_FIX_BROKEN_DEPENDS) {
+          GTask *task = data->task;
+          GsPluginAptkit *plugin = data->plugin;
+          GCancellable *cancellable = g_task_get_cancellable (task);
+          TransactionAction original_action;
+
+          original_action = GPOINTER_TO_INT (
+              g_object_get_data (G_OBJECT (task), "aptkit-action-before-repair"));
+          g_task_set_task_data (task, GINT_TO_POINTER (original_action), NULL);
+
+          g_debug ("Broken dependencies repaired, retrying original action");
+
+          g_signal_handlers_disconnect_by_data (proxy, data);
+          g_object_unref (proxy);
+          g_free (data);
+
+          g_dbus_proxy_call (plugin->aptkit_proxy,
+                             "UpgradeSystem",
+                             g_variant_new ("(b)", GPOINTER_TO_INT (
+                                 g_object_get_data (G_OBJECT (task), "safe-mode"))),
+                             G_DBUS_CALL_FLAGS_NONE,
+                             -1,
+                             cancellable,
+                             aptkit_upgrade_system_cb,
+                             task);
+          return;
+        }
+
         /* we only need to emit updates changed on cache update or system upgrade */
         if (data->action == ACTION_UPGRADE_SYSTEM) {
           for (guint i = 0; i < gs_app_list_length (data->plugin->updatable_apps); i++) {
@@ -318,6 +347,45 @@ aptkit_transaction_signal_cb (GDBusProxy *proxy,
       }
       g_object_unref (proxy);
       g_free (data);
+    } else if (g_strcmp0 (property_name, "Error") == 0) {
+      const gchar *error_code;
+      const gchar *error_details;
+
+      g_variant_get (value, "(&s&s)", &error_code, &error_details);
+
+      if (g_strcmp0 (error_code, "error-cache-broken") == 0 &&
+          (data->action == ACTION_UPGRADE_SYSTEM ||
+           data->action == ACTION_LIST_UPDATES) &&
+          !GPOINTER_TO_INT (g_object_get_data (
+              G_OBJECT (data->task), "aptkit-fix-broken-attempted"))) {
+        GTask *task = data->task;
+        GsPluginAptkit *plugin = data->plugin;
+        GCancellable *cancellable = g_task_get_cancellable (task);
+
+        g_debug ("Broken package dependencies detected: %s", error_details);
+        g_object_set_data (G_OBJECT (task),
+                           "aptkit-fix-broken-attempted",
+                           GINT_TO_POINTER (TRUE));
+        g_object_set_data (G_OBJECT (task),
+                           "aptkit-action-before-repair",
+                           GINT_TO_POINTER (data->action));
+        g_task_set_task_data (task,
+                              GINT_TO_POINTER (ACTION_FIX_BROKEN_DEPENDS),
+                              NULL);
+
+        g_signal_handlers_disconnect_by_data (proxy, data);
+        g_object_unref (proxy);
+        g_free (data);
+
+        g_dbus_proxy_call (plugin->aptkit_proxy,
+                           "FixBrokenDepends",
+                           g_variant_new ("()"),
+                           G_DBUS_CALL_FLAGS_NONE,
+                           -1,
+                           cancellable,
+                           aptkit_upgrade_system_cb,
+                           task);
+      }
     } else if (g_strcmp0 (property_name, "Packages") == 0 ||
                g_strcmp0 (property_name, "Dependencies") == 0) {
       g_autoptr(GVariant) packages = NULL;
